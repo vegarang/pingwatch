@@ -19,10 +19,10 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-./pingwatch.py urls/prod.txt
+./pingwatch.py urls.txt
 ```
 
-The URL file has one URL per line; blank lines and lines starting with `#` are ignored. Example files are in `urls/` (`prod.txt`, `nonprod.txt`, `cow.txt`) and `urls.txt`.
+The URL file has one URL per line; blank lines and lines starting with `#` are ignored. `urls.txt` is a sample file exercising healthy, erroring, redirecting, slow, and unreachable URLs. `urls/` is gitignored — use it to keep your own (e.g. project-specific) URL lists locally without committing them.
 
 ### Options
 
