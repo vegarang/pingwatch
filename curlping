@@ -1,0 +1,9 @@
+#!/bin/bash
+
+while true; do
+    current_time=$(date +"%T")
+    echo -e "$current_time\n"
+    curl -o /dev/null -s -w 'Establish Connection: %{time_connect}s\nTTFB: %{time_starttransfer}s\nTotal: %{time_total}s\nResponse code: %{http_code}\n'  $1
+    echo -e "\n---\n"
+    sleep 1
+done

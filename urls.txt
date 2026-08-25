@@ -1,0 +1,29 @@
+# one URL per line, comments and blank lines are ignored
+#
+# Healthy (should stay default color)
+https://httpbun.com/status/200
+https://httpbingo.org/status/200
+https://example.com
+
+# Non-200 (should turn red, HTTP Err column populated)
+https://httpbun.com/status/404
+https://httpbun.com/status/500
+https://httpbun.com/status/503
+https://httpbingo.org/status/403
+https://httpbingo.org/status/401
+
+# Redirects (curl -w reports the final code after following redirects is NOT
+# default; without -L these report the redirect's own 3xx code, so expect red)
+https://httpbun.com/status/301
+https://httpbingo.org/status/302
+
+# Slow (>2s, should turn yellow, Slow RTT column populated)
+https://httpbun.com/delay/3
+https://httpbingo.org/delay/4
+
+# Unreachable host (curl error, should turn red with error text in HTTP Err)
+https://this-domain-does-not-exist.invalid
+
+# Known to be flaky/rate-limited from some networks - useful to test handling
+# of an intermittently misbehaving target
+https://httpbin.org/status/200
