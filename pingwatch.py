@@ -17,6 +17,7 @@ from textual.widgets import DataTable, Footer, Header
 
 SLOW_THRESHOLD_SECONDS = 3
 STICKY_DURATION = timedelta(minutes=5)
+DEFAULT_RTT_WINDOW_SECONDS = 60
 
 
 @dataclass
@@ -77,6 +78,8 @@ class UrlState:
     baseline_code: int | None = None
     baseline_error: str | None = None
     baseline_set: bool = False
+    rtt_window: timedelta = timedelta(seconds=DEFAULT_RTT_WINDOW_SECONDS)
+    recent_rtts: list[tuple[datetime, float]] = field(default_factory=list)
 
     def is_bad(self, result: PingResult) -> bool:
         if not self.initial_state_normal or not self.baseline_set:
@@ -87,6 +90,9 @@ class UrlState:
         self.last = result
         if result.total_time is not None:
             self.longest_rtt = max(self.longest_rtt, result.total_time)
+            self.recent_rtts.append((result.timestamp, result.total_time))
+            cutoff = result.timestamp - self.rtt_window
+            self.recent_rtts = [(t, r) for t, r in self.recent_rtts if t >= cutoff]
 
         bad = self.is_bad(result)
 
@@ -119,6 +125,11 @@ class UrlState:
 
     def is_warning(self, now: datetime) -> bool:
         return self.slow_until is not None and now < self.slow_until
+
+    def max_rtt_in_window(self, now: datetime) -> float | None:
+        cutoff = now - self.rtt_window
+        rtts = [r for t, r in self.recent_rtts if t >= cutoff]
+        return max(rtts) if rtts else None
 
 
 def setup_logging(log_dir: Path) -> logging.Logger:
@@ -193,6 +204,7 @@ class PingWatchApp(App):
         logger: logging.Logger,
         max_concurrent: int = 20,
         initial_state_normal: bool = False,
+        rtt_window: float = DEFAULT_RTT_WINDOW_SECONDS,
     ):
         super().__init__()
         self.groups = groups
@@ -202,13 +214,17 @@ class PingWatchApp(App):
         self.interval = interval
         self.logger = logger
         self.initial_state_normal = initial_state_normal
+        self.rtt_window = timedelta(seconds=rtt_window)
         self.sem = asyncio.Semaphore(max_concurrent)
         self.states: dict[str, UrlState] = {
-            url: UrlState(url, initial_state_normal=initial_state_normal) for url in self.urls
+            url: UrlState(url, initial_state_normal=initial_state_normal, rtt_window=self.rtt_window)
+            for url in self.urls
         }
         self._row_keys: dict[str, object] = {}
         self._column_keys: dict[str, object] = {}
         self._heading_texts: dict[str, str] = {name: name for name in groups if name}
+        self._heading_row_keys: dict[str, object] = {}
+        self.collapsed: dict[str, bool] = {name: False for name in groups if name}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -224,16 +240,20 @@ class PingWatchApp(App):
             if group_name:
                 heading = Text("\n")
                 heading.append(group_name, style="bold reverse")
-                table.add_row(
+                heading_key = table.add_row(
                     heading,
                     *(Text("\n"),) * (len(COLUMNS) - 1),
                     height=2,
                     key=f"__group__{group_name}",
                 )
+                self._heading_row_keys[group_name] = heading_key
             for url in urls:
                 key = table.add_row(*("-",) * len(COLUMNS), key=url)
                 self._row_keys[url] = key
                 self.render_row(url)
+
+        for group_name in self._heading_row_keys:
+            self.update_group_heading(group_name)
 
         for url in self.urls:
             self.run_worker(self.ping_loop(url), exclusive=False)
@@ -260,6 +280,8 @@ class PingWatchApp(App):
         return ""
 
     def render_row(self, url: str) -> None:
+        if url not in self._row_keys:
+            return
         state = self.states[url]
         result = state.last
         now = datetime.now()
@@ -289,6 +311,52 @@ class PingWatchApp(App):
     def refresh_row_colors(self) -> None:
         for url in self.urls:
             self.render_row(url)
+        for group_name in self._heading_row_keys:
+            self.update_group_heading(group_name)
+        self.reorder_rows()
+
+    def update_group_heading(self, group_name: str) -> None:
+        table = self.query_one(DataTable)
+        row_key = self._heading_row_keys[group_name]
+        urls = self.groups[group_name]
+        now = datetime.now()
+        error_count = sum(1 for u in urls if self.states[u].is_error(now))
+        warning_count = sum(1 for u in urls if self.states[u].is_warning(now))
+        rtts = [
+            rtt for u in urls
+            if (rtt := self.states[u].max_rtt_in_window(now)) is not None
+        ]
+        max_rtt = fmt_seconds(max(rtts)) if rtts else "-"
+        arrow = "▶" if self.collapsed[group_name] else "▼"
+
+        def cell(text: str) -> Text:
+            value = Text("\n")
+            value.append(text, style="bold reverse")
+            return value
+
+        table.update_cell(row_key, self._column_keys["Last RTT"], cell(arrow))
+        table.update_cell(row_key, self._column_keys["Longest RTT"], cell(f"RTT {max_rtt}"))
+        table.update_cell(row_key, self._column_keys["HTTP Err"], cell(f"{error_count} errors"))
+        table.update_cell(row_key, self._column_keys["Slow RTT"], cell(f"{warning_count} warnings"))
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        key = event.row_key.value
+        if isinstance(key, str) and key.startswith("__group__"):
+            self.toggle_group(key[len("__group__"):])
+
+    def toggle_group(self, group_name: str) -> None:
+        self.collapsed[group_name] = not self.collapsed[group_name]
+        table = self.query_one(DataTable)
+        if self.collapsed[group_name]:
+            for url in self.groups[group_name]:
+                if url in self._row_keys:
+                    table.remove_row(self._row_keys.pop(url))
+        else:
+            for url in self.groups[group_name]:
+                key = table.add_row(*("-",) * len(COLUMNS), key=url)
+                self._row_keys[url] = key
+                self.render_row(url)
+        self.update_group_heading(group_name)
         self.reorder_rows()
 
     def row_sort_key(self, url_cell: Text | str) -> tuple:
@@ -325,6 +393,12 @@ def main() -> None:
         action="store_true",
         help="Treat each URL's first observed response as its baseline; flag any deviation (not just non-200) as an error",
     )
+    parser.add_argument(
+        "--rtt-window",
+        type=float,
+        default=DEFAULT_RTT_WINDOW_SECONDS,
+        help=f"Rolling window in seconds for each group's 'highest RTT' heading figure (default: {DEFAULT_RTT_WINDOW_SECONDS})",
+    )
     args = parser.parse_args()
 
     groups = load_groups(args.urls_file)
@@ -339,6 +413,7 @@ def main() -> None:
         logger,
         max_concurrent=args.max_concurrent,
         initial_state_normal=args.initial_state_normal,
+        rtt_window=args.rtt_window,
     )
     app.run()
 
