@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import yaml
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.widgets import DataTable, Footer, Header
@@ -162,6 +163,19 @@ def read_urls(path: Path) -> list[str]:
     return urls
 
 
+def read_url_groups(path: Path) -> dict[str, list[str]]:
+    data = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: expected a mapping of group name to list of URLs")
+    return {str(name): [str(url) for url in (urls or [])] for name, urls in data.items()}
+
+
+def load_groups(path: Path) -> dict[str, list[str]]:
+    if path.suffix.lower() in (".yaml", ".yml"):
+        return read_url_groups(path)
+    return {"": read_urls(path)}
+
+
 def fmt_seconds(value: float | None) -> str:
     return f"{value:.3f}s" if value is not None else "-"
 
@@ -174,23 +188,27 @@ class PingWatchApp(App):
 
     def __init__(
         self,
-        urls: list[str],
+        groups: dict[str, list[str]],
         interval: float,
         logger: logging.Logger,
         max_concurrent: int = 20,
         initial_state_normal: bool = False,
     ):
         super().__init__()
-        self.urls = urls
+        self.groups = groups
+        self.urls = [url for urls in groups.values() for url in urls]
+        self.url_group: dict[str, str] = {url: name for name, urls in groups.items() for url in urls}
+        self.group_index: dict[str, int] = {name: i for i, name in enumerate(groups)}
         self.interval = interval
         self.logger = logger
         self.initial_state_normal = initial_state_normal
         self.sem = asyncio.Semaphore(max_concurrent)
         self.states: dict[str, UrlState] = {
-            url: UrlState(url, initial_state_normal=initial_state_normal) for url in urls
+            url: UrlState(url, initial_state_normal=initial_state_normal) for url in self.urls
         }
         self._row_keys: dict[str, object] = {}
         self._column_keys: dict[str, object] = {}
+        self._heading_texts: dict[str, str] = {name: name for name in groups if name}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -202,10 +220,20 @@ class PingWatchApp(App):
         table.cursor_type = "row"
         column_keys = table.add_columns(*COLUMNS)
         self._column_keys = dict(zip(COLUMNS, column_keys))
-        for url in self.urls:
-            key = table.add_row(*("-",) * len(COLUMNS), key=url)
-            self._row_keys[url] = key
-            self.render_row(url)
+        for group_name, urls in self.groups.items():
+            if group_name:
+                heading = Text("\n")
+                heading.append(group_name, style="bold reverse")
+                table.add_row(
+                    heading,
+                    *(Text("\n"),) * (len(COLUMNS) - 1),
+                    height=2,
+                    key=f"__group__{group_name}",
+                )
+            for url in urls:
+                key = table.add_row(*("-",) * len(COLUMNS), key=url)
+                self._row_keys[url] = key
+                self.render_row(url)
 
         for url in self.urls:
             self.run_worker(self.ping_loop(url), exclusive=False)
@@ -264,14 +292,18 @@ class PingWatchApp(App):
         self.reorder_rows()
 
     def row_sort_key(self, url_cell: Text | str) -> tuple:
-        url = url_cell.plain if isinstance(url_cell, Text) else str(url_cell)
-        state = self.states[url]
+        text = (url_cell.plain if isinstance(url_cell, Text) else str(url_cell)).strip()
+        group_name = self._heading_texts.get(text)
+        if group_name is not None:
+            return (self.group_index[group_name], -1, "")
+        state = self.states[text]
+        group_idx = self.group_index[self.url_group[text]]
         now = datetime.now()
         if state.is_error(now):
-            return (0, -state.error_since.timestamp())
+            return (group_idx, 0, -state.error_since.timestamp())
         if state.is_warning(now):
-            return (1, -state.slow_since.timestamp())
-        return (2, url)
+            return (group_idx, 1, -state.slow_since.timestamp())
+        return (group_idx, 2, text)
 
     def reorder_rows(self) -> None:
         table = self.query_one(DataTable)
@@ -280,7 +312,11 @@ class PingWatchApp(App):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("urls_file", type=Path, help="File with one URL per line")
+    parser.add_argument(
+        "urls_file",
+        type=Path,
+        help="URL list file: a .yaml/.yml file of group name -> list of URLs, or a plain-text file with one URL per line",
+    )
     parser.add_argument("--interval", type=float, default=1.0, help="Seconds between pings per URL (default: 1.0)")
     parser.add_argument("--log-dir", type=Path, default=Path("logs"), help="Directory for info/warning/error logs")
     parser.add_argument("--max-concurrent", type=int, default=20, help="Max curl processes in flight at once (default: 20)")
@@ -291,13 +327,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    urls = read_urls(args.urls_file)
+    groups = load_groups(args.urls_file)
+    urls = [url for urls in groups.values() for url in urls]
     if not urls:
         parser.error(f"No URLs found in {args.urls_file}")
 
     logger = setup_logging(args.log_dir)
     app = PingWatchApp(
-        urls,
+        groups,
         args.interval,
         logger,
         max_concurrent=args.max_concurrent,

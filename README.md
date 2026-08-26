@@ -1,6 +1,6 @@
 # pingwatch
 
-A terminal UI for watching the health of a list of URLs. Pings each URL concurrently on a fixed interval using `curl`, and shows live status in a `textual`-based table — with rows highlighted red on non-200 responses/errors and yellow on slow responses. Rows are kept sorted so errors float to the top, warnings sit just below current errors, and normal URLs are sorted alphabetically below both.
+A terminal UI for watching the health of a list of URLs. Pings each URL concurrently on a fixed interval using `curl`, and shows live status in a `textual`-based table — with rows highlighted red on non-200 responses/errors and yellow on slow responses. URLs can be organized into named groups, each shown as its own labeled section; within a group, rows are kept sorted so errors float to the top, warnings sit just below current errors, and normal URLs are sorted alphabetically below both.
 
 ## Requirements
 
@@ -19,10 +19,23 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-./pingwatch.py urls.txt
+./pingwatch.py urls.yaml
 ```
 
-The URL file has one URL per line; blank lines and lines starting with `#` are ignored. `urls.txt` is a sample file exercising healthy, erroring, redirecting, slow, and unreachable URLs. `urls/` is gitignored — use it to keep your own (e.g. project-specific) URL lists locally without committing them.
+The URL file can be either:
+
+- A **YAML file** (`.yaml`/`.yml`) mapping group name to a list of URLs. Each group is rendered as its own labeled section in the table:
+  ```yaml
+  my-group:
+    - url1.example.com
+    - url2.example.com
+  other-group:
+    - other.url.com
+    - other2.url.com
+  ```
+- A **plain-text file** (any other extension) with one URL per line; blank lines and lines starting with `#` are ignored. All URLs are treated as one ungrouped list, with no heading shown.
+
+`urls.txt` is a sample plain-text file exercising healthy, erroring, redirecting, slow, and unreachable URLs. `urls/` is gitignored — use it to keep your own (e.g. project-specific) URL lists locally without committing them.
 
 ### Options
 

@@ -18,6 +18,8 @@ from pingwatch import (
     PingWatchApp,
     UrlState,
     fmt_seconds,
+    load_groups,
+    read_url_groups,
     read_urls,
 )
 
@@ -96,6 +98,41 @@ def test_read_urls_empty_file(tmp_path: Path):
     path = tmp_path / "empty.txt"
     path.write_text("")
     assert read_urls(path) == []
+
+
+# --- read_url_groups / load_groups ---------------------------------------
+
+
+def test_read_url_groups_parses_named_groups(tmp_path: Path):
+    path = tmp_path / "urls.yaml"
+    path.write_text(
+        "my-group:\n"
+        "  - http://a.example.com\n"
+        "  - http://b.example.com\n"
+        "other-group:\n"
+        "  - http://c.example.com\n"
+    )
+    assert read_url_groups(path) == {
+        "my-group": ["http://a.example.com", "http://b.example.com"],
+        "other-group": ["http://c.example.com"],
+    }
+
+
+def test_read_url_groups_rejects_non_mapping(tmp_path: Path):
+    path = tmp_path / "urls.yaml"
+    path.write_text("- http://a.example.com\n- http://b.example.com\n")
+    with pytest.raises(ValueError):
+        read_url_groups(path)
+
+
+def test_load_groups_dispatches_by_extension(tmp_path: Path):
+    yaml_path = tmp_path / "urls.yaml"
+    yaml_path.write_text("my-group:\n  - http://a.example.com\n")
+    assert load_groups(yaml_path) == {"my-group": ["http://a.example.com"]}
+
+    txt_path = tmp_path / "urls.txt"
+    txt_path.write_text("http://a.example.com\nhttp://b.example.com\n")
+    assert load_groups(txt_path) == {"": ["http://a.example.com", "http://b.example.com"]}
 
 
 # --- fmt_seconds -----------------------------------------------------------
@@ -251,7 +288,7 @@ def test_baseline_mode_curl_error_after_baseline_is_bad():
 
 def make_app(urls: list[str]) -> PingWatchApp:
     logger = logging.getLogger("pingwatch-test")
-    return PingWatchApp(urls, interval=1.0, logger=logger)
+    return PingWatchApp({"": urls}, interval=1.0, logger=logger)
 
 
 def test_row_sort_key_orders_error_before_warning_before_normal():
@@ -366,6 +403,44 @@ def test_row_sort_key_accepts_plain_string_cell():
     app = make_app(["http://example.com"])
     # row_sort_key should handle both Text cells (real usage) and plain strings.
     assert app.row_sort_key("http://example.com") == app.row_sort_key(Text("http://example.com"))
+
+
+def make_grouped_app(groups: dict[str, list[str]]) -> PingWatchApp:
+    logger = logging.getLogger("pingwatch-test")
+    return PingWatchApp(groups, interval=1.0, logger=logger)
+
+
+def test_row_sort_key_keeps_groups_contiguous_even_with_cross_group_error():
+    # An error in the second group must not outrank the first group's rows.
+    app = make_grouped_app(
+        {
+            "first-group": ["http://a.example.com", "http://b.example.com"],
+            "second-group": ["http://err.example.com"],
+        }
+    )
+    for url in ["http://a.example.com", "http://b.example.com"]:
+        app.states[url].apply(make_result(url=url))
+    app.states["http://err.example.com"].apply(make_result(url="http://err.example.com", http_code=500))
+
+    cells = [Text("first-group"), Text("http://a.example.com"), Text("http://b.example.com"), Text("second-group"), Text("http://err.example.com")]
+    ordered = sorted(cells, key=lambda c: app.row_sort_key(c))
+    assert [c.plain for c in ordered] == [
+        "first-group",
+        "http://a.example.com",
+        "http://b.example.com",
+        "second-group",
+        "http://err.example.com",
+    ]
+
+
+def test_row_sort_key_heading_sorts_before_its_group_errors():
+    app = make_grouped_app({"my-group": ["http://err.example.com", "http://ok.example.com"]})
+    app.states["http://err.example.com"].apply(make_result(url="http://err.example.com", http_code=500))
+    app.states["http://ok.example.com"].apply(make_result(url="http://ok.example.com"))
+
+    cells = [Text("http://err.example.com"), Text("http://ok.example.com"), Text("my-group")]
+    ordered = sorted(cells, key=lambda c: app.row_sort_key(c))
+    assert [c.plain for c in ordered] == ["my-group", "http://err.example.com", "http://ok.example.com"]
 
 
 # --- Integration: DataTable actually reorders rows --------------------------
