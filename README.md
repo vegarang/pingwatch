@@ -31,8 +31,15 @@ The URL file has one URL per line; blank lines and lines starting with `#` are i
 | `--interval` | `1.0` | Seconds between pings per URL |
 | `--log-dir` | `logs` | Directory for `info.log`, `warning.log`, `error.log` |
 | `--max-concurrent` | `20` | Max concurrent `curl` processes |
+| `--initial-state-normal` | off | Treat each URL's first observed response as its baseline; flag deviations instead of non-200 |
 
 Press `q` to quit.
+
+### Baseline mode (`--initial-state-normal`)
+
+Some URLs are expected to return a non-200 status (redirects, auth-gated 401/403s, deprecated 410s, etc). Passing `--initial-state-normal` switches the whole run from "200 is ok" to "whatever the URL returned on its first ping is ok" — every URL's baseline is captured independently from its own first response. After that, a URL is only flagged as an error when its status code (or a curl-level failure) *changes* from that baseline, which is useful for catching regressions in surrounding infrastructure (proxies, gateways, etc.) without the noise of URLs that are non-200 by design.
+
+This is a global, whole-run switch — it applies to every URL in the file. If you have a mix of URLs that should always be 200 and URLs with an expected non-200 baseline, put them in separate URL list files and run pingwatch twice. The baseline is only kept in memory for the current run; restarting pingwatch re-captures it from scratch. The **Baseline** column shows what was recorded for each URL.
 
 ### Table columns
 
@@ -40,6 +47,7 @@ Press `q` to quit.
 - **Last RTT** — total time of the most recent request
 - **Last HTTP code** — status code or error from the most recent request
 - **Longest RTT** — slowest total time seen so far
+- **Baseline** — the status code (or error) recorded on the first ping when `--initial-state-normal` is set; `-` otherwise
 - **Ever Non-200** — whether any request has returned a non-200 status or errored
 - **HTTP Err** — sticky (5 min) error code/message after a failure
 - **Slow RTT** — sticky (5 min) RTT after a response slower than 3s
