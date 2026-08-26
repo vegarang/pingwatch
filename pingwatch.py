@@ -69,8 +69,10 @@ class UrlState:
     ever_non_200: bool = False
     error_code: str | None = None
     error_until: datetime | None = None
+    error_since: datetime | None = None
     slow_rtt: float | None = None
     slow_until: datetime | None = None
+    slow_since: datetime | None = None
     baseline_code: int | None = None
     baseline_error: str | None = None
     baseline_set: bool = False
@@ -94,10 +96,19 @@ class UrlState:
             bad = False
 
         if bad:
+            new_error_code = str(result.http_code) if result.http_code is not None else (result.error or "error")
+            # A recurrence of the same error within its still-active sticky window keeps its
+            # existing rank among errors; only a fresh/different error jumps to the top.
+            same_ongoing_error = self.error_code == new_error_code and self.is_error(result.timestamp)
+            if not same_ongoing_error:
+                self.error_since = result.timestamp
             self.ever_non_200 = True
-            self.error_code = str(result.http_code) if result.http_code is not None else (result.error or "error")
+            self.error_code = new_error_code
             self.error_until = result.timestamp + STICKY_DURATION
         if result.slow:
+            same_ongoing_warning = self.is_warning(result.timestamp)
+            if not same_ongoing_warning:
+                self.slow_since = result.timestamp
             self.slow_rtt = result.total_time
             self.slow_until = result.timestamp + STICKY_DURATION
         return bad
@@ -208,6 +219,7 @@ class PingWatchApp(App):
             is_bad = state.apply(result)
             log_result(self.logger, result, is_bad)
             self.render_row(url)
+            self.reorder_rows()
             await asyncio.sleep(self.interval)
 
     def row_style(self, url: str) -> str:
@@ -249,6 +261,21 @@ class PingWatchApp(App):
     def refresh_row_colors(self) -> None:
         for url in self.urls:
             self.render_row(url)
+        self.reorder_rows()
+
+    def row_sort_key(self, url_cell: Text | str) -> tuple:
+        url = url_cell.plain if isinstance(url_cell, Text) else str(url_cell)
+        state = self.states[url]
+        now = datetime.now()
+        if state.is_error(now):
+            return (0, -state.error_since.timestamp())
+        if state.is_warning(now):
+            return (1, -state.slow_since.timestamp())
+        return (2, url)
+
+    def reorder_rows(self) -> None:
+        table = self.query_one(DataTable)
+        table.sort(self._column_keys["URL"], key=self.row_sort_key)
 
 
 def main() -> None:

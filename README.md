@@ -1,6 +1,6 @@
 # pingwatch
 
-A terminal UI for watching the health of a list of URLs. Pings each URL concurrently on a fixed interval using `curl`, and shows live status in a `textual`-based table — with rows highlighted red on non-200 responses/errors and yellow on slow responses.
+A terminal UI for watching the health of a list of URLs. Pings each URL concurrently on a fixed interval using `curl`, and shows live status in a `textual`-based table — with rows highlighted red on non-200 responses/errors and yellow on slow responses. Rows are kept sorted so errors float to the top, warnings sit just below current errors, and normal URLs are sorted alphabetically below both.
 
 ## Requirements
 
@@ -51,6 +51,13 @@ This is a global, whole-run switch — it applies to every URL in the file. If y
 - **Ever Non-200** — whether any request has returned a non-200 status or errored
 - **HTTP Err** — sticky (5 min) error code/message after a failure
 - **Slow RTT** — sticky (5 min) RTT after a response slower than 3s
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
 
 ## curlping
 
