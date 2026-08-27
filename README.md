@@ -45,8 +45,21 @@ The URL file can be either:
 | `--log-dir` | `logs` | Directory for `info.log`, `warning.log`, `error.log` |
 | `--max-concurrent` | `20` | Max concurrent `curl` processes |
 | `--initial-state-normal` | off | Treat each URL's first observed response as its baseline; flag deviations instead of non-200 |
+| `--rtt-window` | `60` | Rolling window in seconds for each group's "highest RTT" heading figure |
+| `--slow-threshold` | `3` | Total request time in seconds above which a result is flagged as slow |
+| `--sticky-duration` | `300` | Seconds an error/slow highlight stays visible after it clears |
 
 Press `q` to quit.
+
+### Changing settings at runtime
+
+`--slow-threshold`, `--sticky-duration`, and `--rtt-window` can also be changed while pingwatch is running, without restarting it, via the command palette (`ctrl+p`, or click the "☰ Palette" item in the footer). Search for one of:
+
+- **Set slow threshold…**
+- **Set sticky duration…**
+- **Set RTT window…**
+
+Each opens a small dialog pre-filled with the current value (in seconds) — enter a new number and press enter to apply, or `esc` to cancel. The change applies immediately to every URL and updates row highlighting right away; it's not persisted, so it reverts to the command-line value (or default) on the next run.
 
 ### Baseline mode (`--initial-state-normal`)
 
@@ -62,8 +75,8 @@ This is a global, whole-run switch — it applies to every URL in the file. If y
 - **Longest RTT** — slowest total time seen so far
 - **Baseline** — the status code (or error) recorded on the first ping when `--initial-state-normal` is set; `-` otherwise
 - **Ever Non-200** — whether any request has returned a non-200 status or errored
-- **HTTP Err** — sticky (5 min) error code/message after a failure
-- **Slow RTT** — sticky (5 min) RTT after a response slower than 3s
+- **HTTP Err** — sticky (`--sticky-duration`, default 5 min) error code/message after a failure
+- **Slow RTT** — sticky (`--sticky-duration`, default 5 min) RTT after a response slower than `--slow-threshold` (default 3s)
 
 ## Development
 
