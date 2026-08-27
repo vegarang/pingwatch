@@ -53,13 +53,16 @@ Press `q` to quit.
 
 ### Changing settings at runtime
 
-`--slow-threshold`, `--sticky-duration`, and `--rtt-window` can also be changed while pingwatch is running, without restarting it, via the command palette (`ctrl+p`, or click the "☰ Palette" item in the footer). Search for one of:
+`--interval`, `--slow-threshold`, `--sticky-duration`, and `--rtt-window` can also be changed while pingwatch is running, without restarting it, via the command palette (`ctrl+p`, or click the "☰ Palette" item in the footer). Search for one of:
 
+- **Set ping interval…**
 - **Set slow threshold…**
 - **Set sticky duration…**
 - **Set RTT window…**
 
 Each opens a small dialog pre-filled with the current value (in seconds) — enter a new number and press enter to apply, or `esc` to cancel. The change applies immediately to every URL and updates row highlighting right away; it's not persisted, so it reverts to the command-line value (or default) on the next run.
+
+The palette also has a **Clear** command, which resets every URL's collected stats — Last HTTP code, Longest RTT, Baseline, Ever Non-200, HTTP Err, and Slow RTT — back to their initial state, without touching the current settings (interval, slow threshold, sticky duration, RTT window).
 
 ### Baseline mode (`--initial-state-normal`)
 

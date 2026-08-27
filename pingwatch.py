@@ -16,7 +16,7 @@ from textual.app import App, ComposeResult
 from textual.command import Hit, Hits, Provider
 from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Input, Label
+from textual.widgets import DataTable, Footer, Header, Input, Label, Static
 
 SLOW_THRESHOLD_SECONDS = 3
 STICKY_DURATION = timedelta(minutes=5)
@@ -88,6 +88,21 @@ class UrlState:
     slow_threshold_seconds: float = SLOW_THRESHOLD_SECONDS
     sticky_duration: timedelta = STICKY_DURATION
     recent_rtts: list[tuple[datetime, float]] = field(default_factory=list)
+
+    def clear(self) -> None:
+        self.last = None
+        self.longest_rtt = 0.0
+        self.ever_non_200 = False
+        self.error_code = None
+        self.error_until = None
+        self.error_since = None
+        self.slow_rtt = None
+        self.slow_until = None
+        self.slow_since = None
+        self.baseline_code = None
+        self.baseline_error = None
+        self.baseline_set = False
+        self.recent_rtts = []
 
     def is_bad(self, result: PingResult) -> bool:
         if not self.initial_state_normal or not self.baseline_set:
@@ -199,7 +214,7 @@ def fmt_seconds(value: float | None) -> str:
     return f"{value:.3f}s" if value is not None else "-"
 
 
-COLUMNS = ("URL", "Last RTT", "Last HTTP code", "Longest RTT", "Baseline", "Ever Non-200", "HTTP Err", "Slow RTT")
+COLUMNS = ("URL", "Last RTT", "Last HTTP code", "Longest RTT", "Baseline", "Ever Error", "HTTP Err", "Slow RTT")
 
 
 class SettingsInputScreen(ModalScreen[float | None]):
@@ -237,9 +252,11 @@ class SettingsCommands(Provider):
         assert isinstance(app, PingWatchApp)
         matcher = self.matcher(query)
         settings = (
+            ("Set ping interval…", f"currently {app.interval}s", app.action_set_interval),
             ("Set slow threshold…", f"currently {app.slow_threshold_seconds}s", app.action_set_slow_threshold),
             ("Set sticky duration…", f"currently {app.sticky_duration.total_seconds()}s", app.action_set_sticky_duration),
             ("Set RTT window…", f"currently {app.rtt_window.total_seconds()}s", app.action_set_rtt_window),
+            ("Clear", "reset all collected stats without losing settings", app.action_clear),
         )
         for name, help_text, callback in settings:
             score = matcher.match(name)
@@ -250,6 +267,15 @@ class SettingsCommands(Provider):
 class PingWatchApp(App):
     BINDINGS = [("q", "quit", "Quit")]
     COMMANDS = App.COMMANDS | {SettingsCommands}
+    CSS = """
+    #settings-bar {
+        dock: top;
+        height: 1;
+        background: $panel;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    """
 
     def __init__(
         self,
@@ -292,10 +318,22 @@ class PingWatchApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield Static(id="settings-bar")
         yield DataTable()
         yield Footer()
 
+    def update_settings_bar(self) -> None:
+        self.query_one("#settings-bar", Static).update(
+            "PingWatch   "
+            f"interval: {self.interval}s   "
+            f"slow threshold: {self.slow_threshold_seconds}s   "
+            f"sticky duration: {self.sticky_duration.total_seconds()}s   "
+            f"RTT window: {self.rtt_window.total_seconds()}s   "
+            "(These values can be set in the palette - just search)"
+        )
+
     def on_mount(self) -> None:
+        self.update_settings_bar()
         table = self.query_one(DataTable)
         table.cursor_type = "row"
         column_keys = table.add_columns(*COLUMNS)
@@ -379,6 +417,18 @@ class PingWatchApp(App):
             self.update_group_heading(group_name)
         self.reorder_rows()
 
+    def action_set_interval(self) -> None:
+        self.push_screen(
+            SettingsInputScreen("Ping interval (seconds)", self.interval),
+            self._apply_interval,
+        )
+
+    def _apply_interval(self, value: float | None) -> None:
+        if value is None:
+            return
+        self.interval = value
+        self.update_settings_bar()
+
     def action_set_slow_threshold(self) -> None:
         self.push_screen(
             SettingsInputScreen("Slow threshold (seconds)", self.slow_threshold_seconds),
@@ -392,6 +442,7 @@ class PingWatchApp(App):
         for state in self.states.values():
             state.slow_threshold_seconds = value
         self.refresh_row_colors()
+        self.update_settings_bar()
 
     def action_set_sticky_duration(self) -> None:
         self.push_screen(
@@ -406,6 +457,7 @@ class PingWatchApp(App):
         for state in self.states.values():
             state.sticky_duration = self.sticky_duration
         self.refresh_row_colors()
+        self.update_settings_bar()
 
     def action_set_rtt_window(self) -> None:
         self.push_screen(
@@ -419,6 +471,12 @@ class PingWatchApp(App):
         self.rtt_window = timedelta(seconds=value)
         for state in self.states.values():
             state.rtt_window = self.rtt_window
+        self.refresh_row_colors()
+        self.update_settings_bar()
+
+    def action_clear(self) -> None:
+        for state in self.states.values():
+            state.clear()
         self.refresh_row_colors()
 
     def update_group_heading(self, group_name: str) -> None:
