@@ -11,6 +11,7 @@ from textual.widgets import DataTable
 
 import logging
 
+import pingwatch
 from pingwatch import (
     COLUMNS,
     STICKY_DURATION,
@@ -22,6 +23,11 @@ from pingwatch import (
     read_url_groups,
     read_urls,
 )
+
+
+async def no_op_ping(url: str, sem) -> PingResult:
+    async with sem:
+        return make_result(url=url)
 
 
 def make_result(
@@ -113,8 +119,8 @@ def test_read_url_groups_parses_named_groups(tmp_path: Path):
         "  - http://c.example.com\n"
     )
     assert read_url_groups(path) == {
-        "my-group": ["http://a.example.com", "http://b.example.com"],
-        "other-group": ["http://c.example.com"],
+        "MY-GROUP": ["http://a.example.com", "http://b.example.com"],
+        "OTHER-GROUP": ["http://c.example.com"],
     }
 
 
@@ -128,7 +134,7 @@ def test_read_url_groups_rejects_non_mapping(tmp_path: Path):
 def test_load_groups_dispatches_by_extension(tmp_path: Path):
     yaml_path = tmp_path / "urls.yaml"
     yaml_path.write_text("my-group:\n  - http://a.example.com\n")
-    assert load_groups(yaml_path) == {"my-group": ["http://a.example.com"]}
+    assert load_groups(yaml_path) == {"MY-GROUP": ["http://a.example.com"]}
 
     txt_path = tmp_path / "urls.txt"
     txt_path.write_text("http://a.example.com\nhttp://b.example.com\n")
@@ -246,6 +252,19 @@ def test_apply_error_uses_curl_error_string_when_no_http_code():
     assert state.error_code == "timeout"
 
 
+def test_apply_respects_custom_slow_threshold():
+    state = UrlState(url="http://example.com", slow_threshold_seconds=1.0)
+    state.apply(make_result(total_time=1.5))
+    assert state.slow_rtt == 1.5
+
+
+def test_apply_respects_custom_sticky_duration():
+    state = UrlState(url="http://example.com", sticky_duration=timedelta(seconds=10))
+    now = datetime.now()
+    state.apply(make_result(http_code=500, timestamp=now))
+    assert state.error_until == now + timedelta(seconds=10)
+
+
 # --- UrlState with --initial-state-normal (baseline mode) -----------------
 
 
@@ -281,6 +300,69 @@ def test_baseline_mode_curl_error_after_baseline_is_bad():
 
     is_bad = state.apply(make_result(http_code=None, error="timeout"))
     assert is_bad is True
+
+
+# --- PingWatchApp runtime settings (command palette callbacks) -------------
+
+
+@pytest.mark.asyncio
+async def test_apply_slow_threshold_propagates_to_all_states(monkeypatch):
+    monkeypatch.setattr(pingwatch, "ping", no_op_ping)
+    app = make_app(["http://a.example.com", "http://b.example.com"])
+    async with app.run_test():
+        app._apply_slow_threshold(9.5)
+        assert app.slow_threshold_seconds == 9.5
+        assert all(state.slow_threshold_seconds == 9.5 for state in app.states.values())
+
+
+@pytest.mark.asyncio
+async def test_apply_slow_threshold_ignores_none(monkeypatch):
+    monkeypatch.setattr(pingwatch, "ping", no_op_ping)
+    app = make_app(["http://a.example.com"])
+    async with app.run_test():
+        original = app.slow_threshold_seconds
+        app._apply_slow_threshold(None)
+        assert app.slow_threshold_seconds == original
+
+
+@pytest.mark.asyncio
+async def test_apply_sticky_duration_propagates_to_all_states(monkeypatch):
+    monkeypatch.setattr(pingwatch, "ping", no_op_ping)
+    app = make_app(["http://a.example.com", "http://b.example.com"])
+    async with app.run_test():
+        app._apply_sticky_duration(30.0)
+        assert app.sticky_duration == timedelta(seconds=30)
+        assert all(state.sticky_duration == timedelta(seconds=30) for state in app.states.values())
+
+
+@pytest.mark.asyncio
+async def test_apply_sticky_duration_ignores_none(monkeypatch):
+    monkeypatch.setattr(pingwatch, "ping", no_op_ping)
+    app = make_app(["http://a.example.com"])
+    async with app.run_test():
+        original = app.sticky_duration
+        app._apply_sticky_duration(None)
+        assert app.sticky_duration == original
+
+
+@pytest.mark.asyncio
+async def test_apply_rtt_window_propagates_to_all_states(monkeypatch):
+    monkeypatch.setattr(pingwatch, "ping", no_op_ping)
+    app = make_app(["http://a.example.com", "http://b.example.com"])
+    async with app.run_test():
+        app._apply_rtt_window(120.0)
+        assert app.rtt_window == timedelta(seconds=120)
+        assert all(state.rtt_window == timedelta(seconds=120) for state in app.states.values())
+
+
+@pytest.mark.asyncio
+async def test_apply_rtt_window_ignores_none(monkeypatch):
+    monkeypatch.setattr(pingwatch, "ping", no_op_ping)
+    app = make_app(["http://a.example.com"])
+    async with app.run_test():
+        original = app.rtt_window
+        app._apply_rtt_window(None)
+        assert app.rtt_window == original
 
 
 # --- PingWatchApp.row_sort_key / reorder_rows -------------------------------
@@ -447,7 +529,8 @@ def test_row_sort_key_heading_sorts_before_its_group_errors():
 
 
 @pytest.mark.asyncio
-async def test_reorder_rows_moves_new_error_to_top():
+async def test_reorder_rows_moves_new_error_to_top(monkeypatch):
+    monkeypatch.setattr(pingwatch, "ping", no_op_ping)
     urls = ["http://alpha.example.com", "http://beta.example.com", "http://gamma.example.com"]
     app = make_app(urls)
 

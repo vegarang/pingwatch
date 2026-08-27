@@ -13,7 +13,10 @@ from pathlib import Path
 import yaml
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.widgets import DataTable, Footer, Header
+from textual.command import Hit, Hits, Provider
+from textual.containers import Vertical
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Footer, Header, Input, Label
 
 SLOW_THRESHOLD_SECONDS = 3
 STICKY_DURATION = timedelta(minutes=5)
@@ -36,7 +39,10 @@ class PingResult:
 
     @property
     def slow(self) -> bool:
-        return self.total_time is not None and self.total_time > SLOW_THRESHOLD_SECONDS
+        return self.is_slow(SLOW_THRESHOLD_SECONDS)
+
+    def is_slow(self, threshold: float) -> bool:
+        return self.total_time is not None and self.total_time > threshold
 
 
 CURL_FORMAT = "%{time_connect}|%{time_starttransfer}|%{time_total}|%{http_code}"
@@ -79,6 +85,8 @@ class UrlState:
     baseline_error: str | None = None
     baseline_set: bool = False
     rtt_window: timedelta = timedelta(seconds=DEFAULT_RTT_WINDOW_SECONDS)
+    slow_threshold_seconds: float = SLOW_THRESHOLD_SECONDS
+    sticky_duration: timedelta = STICKY_DURATION
     recent_rtts: list[tuple[datetime, float]] = field(default_factory=list)
 
     def is_bad(self, result: PingResult) -> bool:
@@ -111,13 +119,13 @@ class UrlState:
                 self.error_since = result.timestamp
             self.ever_non_200 = True
             self.error_code = new_error_code
-            self.error_until = result.timestamp + STICKY_DURATION
-        if result.slow:
+            self.error_until = result.timestamp + self.sticky_duration
+        if result.is_slow(self.slow_threshold_seconds):
             same_ongoing_warning = self.is_warning(result.timestamp)
             if not same_ongoing_warning:
                 self.slow_since = result.timestamp
             self.slow_rtt = result.total_time
-            self.slow_until = result.timestamp + STICKY_DURATION
+            self.slow_until = result.timestamp + self.sticky_duration
         return bad
 
     def is_error(self, now: datetime) -> bool:
@@ -148,7 +156,7 @@ def setup_logging(log_dir: Path) -> logging.Logger:
     return logger
 
 
-def log_result(logger: logging.Logger, result: PingResult, is_bad: bool) -> None:
+def log_result(logger: logging.Logger, result: PingResult, is_bad: bool, slow_threshold: float) -> None:
     if result.error is not None:
         msg = f"{result.url} ERROR {result.error}"
         logger.error(msg)
@@ -161,7 +169,7 @@ def log_result(logger: logging.Logger, result: PingResult, is_bad: bool) -> None
     logger.info(msg)
     if is_bad:
         logger.error(msg)
-    if result.slow:
+    if result.is_slow(slow_threshold):
         logger.warning(msg)
 
 
@@ -178,7 +186,7 @@ def read_url_groups(path: Path) -> dict[str, list[str]]:
     data = yaml.safe_load(path.read_text()) or {}
     if not isinstance(data, dict):
         raise ValueError(f"{path}: expected a mapping of group name to list of URLs")
-    return {str(name): [str(url) for url in (urls or [])] for name, urls in data.items()}
+    return {str(name).upper(): [str(url) for url in (urls or [])] for name, urls in data.items()}
 
 
 def load_groups(path: Path) -> dict[str, list[str]]:
@@ -194,8 +202,54 @@ def fmt_seconds(value: float | None) -> str:
 COLUMNS = ("URL", "Last RTT", "Last HTTP code", "Longest RTT", "Baseline", "Ever Non-200", "HTTP Err", "Slow RTT")
 
 
+class SettingsInputScreen(ModalScreen[float | None]):
+    """Modal prompt used by the command palette to edit a single numeric setting."""
+
+    def __init__(self, label: str, current_value: float) -> None:
+        super().__init__()
+        self.label = label
+        self.current_value = current_value
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="settings-dialog"):
+            yield Label(self.label)
+            yield Input(value=str(self.current_value), type="number")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        try:
+            value = float(event.value)
+        except ValueError:
+            return
+        self.dismiss(value)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
+
+class SettingsCommands(Provider):
+    """Command palette entries for adjusting pingwatch's live-tunable settings."""
+
+    async def search(self, query: str) -> Hits:
+        app = self.app
+        assert isinstance(app, PingWatchApp)
+        matcher = self.matcher(query)
+        settings = (
+            ("Set slow threshold…", f"currently {app.slow_threshold_seconds}s", app.action_set_slow_threshold),
+            ("Set sticky duration…", f"currently {app.sticky_duration.total_seconds()}s", app.action_set_sticky_duration),
+            ("Set RTT window…", f"currently {app.rtt_window.total_seconds()}s", app.action_set_rtt_window),
+        )
+        for name, help_text, callback in settings:
+            score = matcher.match(name)
+            if score > 0:
+                yield Hit(score, matcher.highlight(name), callback, help=help_text)
+
+
 class PingWatchApp(App):
     BINDINGS = [("q", "quit", "Quit")]
+    COMMANDS = App.COMMANDS | {SettingsCommands}
 
     def __init__(
         self,
@@ -205,6 +259,8 @@ class PingWatchApp(App):
         max_concurrent: int = 20,
         initial_state_normal: bool = False,
         rtt_window: float = DEFAULT_RTT_WINDOW_SECONDS,
+        slow_threshold: float = SLOW_THRESHOLD_SECONDS,
+        sticky_duration: float = STICKY_DURATION.total_seconds(),
     ):
         super().__init__()
         self.groups = groups
@@ -215,9 +271,17 @@ class PingWatchApp(App):
         self.logger = logger
         self.initial_state_normal = initial_state_normal
         self.rtt_window = timedelta(seconds=rtt_window)
+        self.slow_threshold_seconds = slow_threshold
+        self.sticky_duration = timedelta(seconds=sticky_duration)
         self.sem = asyncio.Semaphore(max_concurrent)
         self.states: dict[str, UrlState] = {
-            url: UrlState(url, initial_state_normal=initial_state_normal, rtt_window=self.rtt_window)
+            url: UrlState(
+                url,
+                initial_state_normal=initial_state_normal,
+                rtt_window=self.rtt_window,
+                slow_threshold_seconds=self.slow_threshold_seconds,
+                sticky_duration=self.sticky_duration,
+            )
             for url in self.urls
         }
         self._row_keys: dict[str, object] = {}
@@ -265,7 +329,7 @@ class PingWatchApp(App):
         while True:
             result = await ping(url, self.sem)
             is_bad = state.apply(result)
-            log_result(self.logger, result, is_bad)
+            log_result(self.logger, result, is_bad, state.slow_threshold_seconds)
             self.render_row(url)
             self.reorder_rows()
             await asyncio.sleep(self.interval)
@@ -314,6 +378,48 @@ class PingWatchApp(App):
         for group_name in self._heading_row_keys:
             self.update_group_heading(group_name)
         self.reorder_rows()
+
+    def action_set_slow_threshold(self) -> None:
+        self.push_screen(
+            SettingsInputScreen("Slow threshold (seconds)", self.slow_threshold_seconds),
+            self._apply_slow_threshold,
+        )
+
+    def _apply_slow_threshold(self, value: float | None) -> None:
+        if value is None:
+            return
+        self.slow_threshold_seconds = value
+        for state in self.states.values():
+            state.slow_threshold_seconds = value
+        self.refresh_row_colors()
+
+    def action_set_sticky_duration(self) -> None:
+        self.push_screen(
+            SettingsInputScreen("Sticky duration (seconds)", self.sticky_duration.total_seconds()),
+            self._apply_sticky_duration,
+        )
+
+    def _apply_sticky_duration(self, value: float | None) -> None:
+        if value is None:
+            return
+        self.sticky_duration = timedelta(seconds=value)
+        for state in self.states.values():
+            state.sticky_duration = self.sticky_duration
+        self.refresh_row_colors()
+
+    def action_set_rtt_window(self) -> None:
+        self.push_screen(
+            SettingsInputScreen("RTT window (seconds)", self.rtt_window.total_seconds()),
+            self._apply_rtt_window,
+        )
+
+    def _apply_rtt_window(self, value: float | None) -> None:
+        if value is None:
+            return
+        self.rtt_window = timedelta(seconds=value)
+        for state in self.states.values():
+            state.rtt_window = self.rtt_window
+        self.refresh_row_colors()
 
     def update_group_heading(self, group_name: str) -> None:
         table = self.query_one(DataTable)
@@ -399,6 +505,18 @@ def main() -> None:
         default=DEFAULT_RTT_WINDOW_SECONDS,
         help=f"Rolling window in seconds for each group's 'highest RTT' heading figure (default: {DEFAULT_RTT_WINDOW_SECONDS})",
     )
+    parser.add_argument(
+        "--slow-threshold",
+        type=float,
+        default=SLOW_THRESHOLD_SECONDS,
+        help=f"Total request time in seconds above which a result is flagged as slow (default: {SLOW_THRESHOLD_SECONDS})",
+    )
+    parser.add_argument(
+        "--sticky-duration",
+        type=float,
+        default=STICKY_DURATION.total_seconds(),
+        help=f"Seconds an error/slow highlight stays visible after it clears (default: {STICKY_DURATION.total_seconds()})",
+    )
     args = parser.parse_args()
 
     groups = load_groups(args.urls_file)
@@ -414,6 +532,8 @@ def main() -> None:
         max_concurrent=args.max_concurrent,
         initial_state_normal=args.initial_state_normal,
         rtt_window=args.rtt_window,
+        slow_threshold=args.slow_threshold,
+        sticky_duration=args.sticky_duration,
     )
     app.run()
 
