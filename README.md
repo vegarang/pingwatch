@@ -11,9 +11,17 @@ A terminal UI for watching the health of a list of URLs. Pings each URL concurre
 ## Setup
 
 ```bash
-python3 -m venv .venv
+uv venv --python 3.13 .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+uv pip install -r requirements.txt
+```
+
+Using [`uv`](https://docs.astral.sh/uv/) here (instead of a plain `python3 -m venv`) matters: it manages its own Python builds independent of Homebrew, so `.venv` keeps working across `brew upgrade` runs that remove a versioned `python@X.Y` formula. If `.venv` ever breaks after a Homebrew upgrade (e.g. `ModuleNotFoundError` for a package that's clearly installed), it's because the venv was pinned to a Homebrew Python that Homebrew has since deleted — the fix is to rebuild it:
+
+```bash
+rm -rf .venv
+uv venv --python 3.13 .venv
+uv pip install -r requirements.txt -r requirements-dev.txt
 ```
 
 ## Usage
@@ -84,7 +92,7 @@ This is a global, whole-run switch — it applies to every URL in the file. If y
 ## Development
 
 ```bash
-pip install -r requirements-dev.txt
+uv pip install -r requirements-dev.txt
 pytest
 ```
 
