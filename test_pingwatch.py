@@ -25,7 +25,7 @@ from pingwatch import (
 )
 
 
-async def no_op_ping(url: str, sem) -> PingResult:
+async def no_op_ping(url: str, session, sem) -> PingResult:
     async with sem:
         return make_result(url=url)
 

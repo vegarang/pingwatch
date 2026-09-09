@@ -9,7 +9,9 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
+import aiohttp
 import yaml
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -45,27 +47,61 @@ class PingResult:
         return self.total_time is not None and self.total_time > threshold
 
 
-CURL_FORMAT = "%{time_connect}|%{time_starttransfer}|%{time_total}|%{http_code}"
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 
-async def ping(url: str, sem: asyncio.Semaphore) -> PingResult:
+def _make_trace_config() -> aiohttp.TraceConfig:
+    """Times connect and time-to-first-byte for a single request, mirroring curl's -w timings.
+
+    The per-request timing state lives on `trace_config_ctx.trace_request_ctx` (the object we
+    pass in as `trace_request_ctx=` below), not on `trace_config_ctx` itself.
+    """
+
+    async def on_request_start(session, trace_config_ctx, params):
+        ctx = trace_config_ctx.trace_request_ctx
+        ctx.start = asyncio.get_event_loop().time()
+        ctx.connect_time = 0.0  # stays 0 when a pooled connection is reused, same as no new handshake
+
+    async def on_connection_create_end(session, trace_config_ctx, params):
+        ctx = trace_config_ctx.trace_request_ctx
+        ctx.connect_time = asyncio.get_event_loop().time() - ctx.start
+
+    async def on_response_chunk_received(session, trace_config_ctx, params):
+        ctx = trace_config_ctx.trace_request_ctx
+        if ctx.ttfb is None:
+            ctx.ttfb = asyncio.get_event_loop().time() - ctx.start
+
+    trace_config = aiohttp.TraceConfig()
+    trace_config.on_request_start.append(on_request_start)
+    trace_config.on_connection_create_end.append(on_connection_create_end)
+    trace_config.on_response_chunk_received.append(on_response_chunk_received)
+    return trace_config
+
+
+def make_session(max_concurrent: int) -> aiohttp.ClientSession:
+    """A single session shared by all pings, so keep-alive connections and DNS results are reused."""
+    connector = aiohttp.TCPConnector(limit=max_concurrent)
+    return aiohttp.ClientSession(
+        connector=connector,
+        timeout=REQUEST_TIMEOUT,
+        trace_configs=[_make_trace_config()],
+    )
+
+
+async def ping(url: str, session: aiohttp.ClientSession, sem: asyncio.Semaphore) -> PingResult:
     now = datetime.now()
-    async with sem:
-        proc = await asyncio.create_subprocess_exec(
-            "curl", "-o", "/dev/null", "-s", "-w", CURL_FORMAT, url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-
-    if proc.returncode != 0:
-        return PingResult(url, now, None, None, None, None, error=stderr.decode().strip() or "curl error")
-
+    ctx = SimpleNamespace(start=None, connect_time=0.0, ttfb=None)
+    loop_start = asyncio.get_event_loop().time()
     try:
-        connect_s, ttfb_s, total_s, code_s = stdout.decode().strip().split("|")
-        return PingResult(url, now, float(connect_s), float(ttfb_s), float(total_s), int(code_s))
-    except (ValueError, IndexError):
-        return PingResult(url, now, None, None, None, None, error=f"unparseable curl output: {stdout!r}")
+        async with sem:
+            async with session.get(url, trace_request_ctx=ctx) as resp:
+                await resp.read()
+                total_time = asyncio.get_event_loop().time() - loop_start
+                return PingResult(url, now, ctx.connect_time, ctx.ttfb, total_time, resp.status)
+    except asyncio.TimeoutError:
+        return PingResult(url, now, None, None, None, None, error="request timed out")
+    except aiohttp.ClientError as exc:
+        return PingResult(url, now, None, None, None, None, error=str(exc) or type(exc).__name__)
 
 
 @dataclass
@@ -301,6 +337,7 @@ class PingWatchApp(App):
         self.rtt_window = timedelta(seconds=rtt_window)
         self.slow_threshold_seconds = slow_threshold
         self.sticky_duration = timedelta(seconds=sticky_duration)
+        self.max_concurrent = max_concurrent
         self.sem = asyncio.Semaphore(max_concurrent)
         self.states: dict[str, UrlState] = {
             url: UrlState(
@@ -359,6 +396,8 @@ class PingWatchApp(App):
         for group_name in self._heading_row_keys:
             self.update_group_heading(group_name)
 
+        self.session = make_session(self.max_concurrent)
+
         for url in self.urls:
             for stream in range(self.requests_per_url):
                 offset = (self.interval / self.requests_per_url) * stream
@@ -366,12 +405,15 @@ class PingWatchApp(App):
 
         self.set_interval(1.0, self.refresh_row_colors)
 
+    async def on_unmount(self) -> None:
+        await self.session.close()
+
     async def ping_loop(self, url: str, initial_delay: float = 0.0) -> None:
         if initial_delay:
             await asyncio.sleep(initial_delay)
         state = self.states[url]
         while True:
-            result = await ping(url, self.sem)
+            result = await ping(url, self.session, self.sem)
             is_bad = state.apply(result)
             log_result(self.logger, result, is_bad, state.slow_threshold_seconds)
             self.render_row(url)
