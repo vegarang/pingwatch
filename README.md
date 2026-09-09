@@ -52,6 +52,7 @@ The URL file can be either:
 | `--interval` | `1.0` | Seconds between pings per URL |
 | `--log-dir` | `logs` | Directory for `info.log`, `warning.log`, `error.log` |
 | `--max-concurrent` | `20` | Max concurrent `curl` processes |
+| `--requests-per-url` | `1` | Independent, overlapping ping streams to run per URL |
 | `--initial-state-normal` | off | Treat each URL's first observed response as its baseline; flag deviations instead of non-200 |
 | `--rtt-window` | `60` | Rolling window in seconds for each group's "highest RTT" heading figure |
 | `--slow-threshold` | `3` | Total request time in seconds above which a result is flagged as slow |

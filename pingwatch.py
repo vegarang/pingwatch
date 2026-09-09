@@ -287,6 +287,7 @@ class PingWatchApp(App):
         rtt_window: float = DEFAULT_RTT_WINDOW_SECONDS,
         slow_threshold: float = SLOW_THRESHOLD_SECONDS,
         sticky_duration: float = STICKY_DURATION.total_seconds(),
+        requests_per_url: int = 1,
     ):
         super().__init__()
         self.groups = groups
@@ -294,6 +295,7 @@ class PingWatchApp(App):
         self.url_group: dict[str, str] = {url: name for name, urls in groups.items() for url in urls}
         self.group_index: dict[str, int] = {name: i for i, name in enumerate(groups)}
         self.interval = interval
+        self.requests_per_url = requests_per_url
         self.logger = logger
         self.initial_state_normal = initial_state_normal
         self.rtt_window = timedelta(seconds=rtt_window)
@@ -358,11 +360,15 @@ class PingWatchApp(App):
             self.update_group_heading(group_name)
 
         for url in self.urls:
-            self.run_worker(self.ping_loop(url), exclusive=False)
+            for stream in range(self.requests_per_url):
+                offset = (self.interval / self.requests_per_url) * stream
+                self.run_worker(self.ping_loop(url, initial_delay=offset), exclusive=False)
 
         self.set_interval(1.0, self.refresh_row_colors)
 
-    async def ping_loop(self, url: str) -> None:
+    async def ping_loop(self, url: str, initial_delay: float = 0.0) -> None:
+        if initial_delay:
+            await asyncio.sleep(initial_delay)
         state = self.states[url]
         while True:
             result = await ping(url, self.sem)
@@ -553,6 +559,12 @@ def main() -> None:
     parser.add_argument("--log-dir", type=Path, default=Path("logs"), help="Directory for info/warning/error logs")
     parser.add_argument("--max-concurrent", type=int, default=20, help="Max curl processes in flight at once (default: 20)")
     parser.add_argument(
+        "--requests-per-url",
+        type=int,
+        default=1,
+        help="Number of independent, overlapping ping streams to run per URL (default: 1)",
+    )
+    parser.add_argument(
         "--initial-state-normal",
         action="store_true",
         help="Treat each URL's first observed response as its baseline; flag any deviation (not just non-200) as an error",
@@ -592,6 +604,7 @@ def main() -> None:
         rtt_window=args.rtt_window,
         slow_threshold=args.slow_threshold,
         sticky_duration=args.sticky_duration,
+        requests_per_url=args.requests_per_url,
     )
     app.run()
 
