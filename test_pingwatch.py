@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+from rich.style import Style
 from rich.text import Text
 from textual.widgets import DataTable
 
@@ -18,6 +19,7 @@ from pingwatch import (
     PingResult,
     PingWatchApp,
     UrlState,
+    Target,
     fmt_seconds,
     load_groups,
     read_url_groups,
@@ -119,8 +121,8 @@ def test_read_url_groups_parses_named_groups(tmp_path: Path):
         "  - http://c.example.com\n"
     )
     assert read_url_groups(path) == {
-        "MY-GROUP": ["http://a.example.com", "http://b.example.com"],
-        "OTHER-GROUP": ["http://c.example.com"],
+        "MY-GROUP": [Target("target:0:0", "http://a.example.com"), Target("target:0:1", "http://b.example.com")],
+        "OTHER-GROUP": [Target("target:1:0", "http://c.example.com")],
     }
 
 
@@ -134,11 +136,11 @@ def test_read_url_groups_rejects_non_mapping(tmp_path: Path):
 def test_load_groups_dispatches_by_extension(tmp_path: Path):
     yaml_path = tmp_path / "urls.yaml"
     yaml_path.write_text("my-group:\n  - http://a.example.com\n")
-    assert load_groups(yaml_path) == {"MY-GROUP": ["http://a.example.com"]}
+    assert load_groups(yaml_path) == {"MY-GROUP": [Target("target:0:0", "http://a.example.com")]}
 
     txt_path = tmp_path / "urls.txt"
     txt_path.write_text("http://a.example.com\nhttp://b.example.com\n")
-    assert load_groups(txt_path) == {"": ["http://a.example.com", "http://b.example.com"]}
+    assert load_groups(txt_path) == {"": [Target("target:0:0", "http://a.example.com"), Target("target:0:1", "http://b.example.com")]}
 
 
 # --- fmt_seconds -----------------------------------------------------------
@@ -368,6 +370,27 @@ async def test_apply_rtt_window_ignores_none(monkeypatch):
 # --- PingWatchApp.row_sort_key / reorder_rows -------------------------------
 
 
+def target_id(app: PingWatchApp, url: str) -> str:
+    return next(target.id for target in app.targets.values() if target.url == url)
+
+
+def state_for(app: PingWatchApp, url: str) -> UrlState:
+    return app.states[target_id(app, url)]
+
+
+def sorted_urls(app: PingWatchApp) -> list[str]:
+    ids = sorted(app.targets, key=lambda key: app.row_sort_key(app.url_cell(key)))
+    return [app.targets[key].url for key in ids]
+
+
+def url_cell(app: PingWatchApp, url: str) -> Text:
+    return app.url_cell(target_id(app, url))
+
+
+def group_cell(name: str) -> Text:
+    return Text(name, style=Style(meta={"group": name}))
+
+
 def make_app(urls: list[str]) -> PingWatchApp:
     logger = logging.getLogger("pingwatch-test")
     return PingWatchApp({"": urls}, interval=1.0, logger=logger)
@@ -377,12 +400,12 @@ def test_row_sort_key_orders_error_before_warning_before_normal():
     app = make_app(["http://err.example.com", "http://warn.example.com", "http://ok.example.com"])
     now = datetime.now()
 
-    app.states["http://err.example.com"].apply(make_result(url="http://err.example.com", http_code=500, timestamp=now))
-    app.states["http://warn.example.com"].apply(make_result(url="http://warn.example.com", total_time=5.0, timestamp=now))
-    app.states["http://ok.example.com"].apply(make_result(url="http://ok.example.com", timestamp=now))
+    state_for(app, "http://err.example.com").apply(make_result(url="http://err.example.com", http_code=500, timestamp=now))
+    state_for(app, "http://warn.example.com").apply(make_result(url="http://warn.example.com", total_time=5.0, timestamp=now))
+    state_for(app, "http://ok.example.com").apply(make_result(url="http://ok.example.com", timestamp=now))
 
     keys = {
-        url: app.row_sort_key(Text(url))
+        url: app.row_sort_key(url_cell(app, url))
         for url in ["http://err.example.com", "http://warn.example.com", "http://ok.example.com"]
     }
     ordered = sorted(keys, key=lambda u: keys[u])
@@ -391,10 +414,10 @@ def test_row_sort_key_orders_error_before_warning_before_normal():
 
 def test_row_sort_key_normal_urls_sorted_alphabetically():
     app = make_app(["http://zeta.example.com", "http://alpha.example.com", "http://beta.example.com"])
-    for url in app.urls:
-        app.states[url].apply(make_result(url=url))
+    for url in [target.url for target in app.targets.values()]:
+        state_for(app, url).apply(make_result(url=url))
 
-    ordered = sorted(app.urls, key=lambda u: app.row_sort_key(Text(u)))
+    ordered = sorted_urls(app)
     assert ordered == [
         "http://alpha.example.com",
         "http://beta.example.com",
@@ -407,14 +430,14 @@ def test_row_sort_key_most_recent_error_sorts_first():
     older = datetime.now() - timedelta(seconds=30)
     newer = datetime.now()
 
-    app.states["http://old-error.example.com"].apply(
+    state_for(app, "http://old-error.example.com").apply(
         make_result(url="http://old-error.example.com", http_code=500, timestamp=older)
     )
-    app.states["http://new-error.example.com"].apply(
+    state_for(app, "http://new-error.example.com").apply(
         make_result(url="http://new-error.example.com", http_code=500, timestamp=newer)
     )
 
-    ordered = sorted(app.urls, key=lambda u: app.row_sort_key(Text(u)))
+    ordered = sorted_urls(app)
     assert ordered == ["http://new-error.example.com", "http://old-error.example.com"]
 
 
@@ -423,14 +446,14 @@ def test_row_sort_key_most_recent_warning_sorts_first():
     older = datetime.now() - timedelta(seconds=30)
     newer = datetime.now()
 
-    app.states["http://old-warn.example.com"].apply(
+    state_for(app, "http://old-warn.example.com").apply(
         make_result(url="http://old-warn.example.com", total_time=5.0, timestamp=older)
     )
-    app.states["http://new-warn.example.com"].apply(
+    state_for(app, "http://new-warn.example.com").apply(
         make_result(url="http://new-warn.example.com", total_time=5.0, timestamp=newer)
     )
 
-    ordered = sorted(app.urls, key=lambda u: app.row_sort_key(Text(u)))
+    ordered = sorted_urls(app)
     assert ordered == ["http://new-warn.example.com", "http://old-warn.example.com"]
 
 
@@ -441,21 +464,21 @@ def test_row_sort_key_repeated_same_error_keeps_previous_rank():
     t2 = t0 + timedelta(seconds=2)
 
     # first-error errors first, so it ranks above second-error.
-    app.states["http://first-error.example.com"].apply(
+    state_for(app, "http://first-error.example.com").apply(
         make_result(url="http://first-error.example.com", http_code=500, timestamp=t0)
     )
-    app.states["http://second-error.example.com"].apply(
+    state_for(app, "http://second-error.example.com").apply(
         make_result(url="http://second-error.example.com", http_code=500, timestamp=t1)
     )
-    ordered = sorted(app.urls, key=lambda u: app.row_sort_key(Text(u)))
+    ordered = sorted_urls(app)
     assert ordered == ["http://second-error.example.com", "http://first-error.example.com"]
 
     # first-error keeps erroring with the SAME code on a later ping -- it should NOT
     # jump back above second-error just because it was pinged again.
-    app.states["http://first-error.example.com"].apply(
+    state_for(app, "http://first-error.example.com").apply(
         make_result(url="http://first-error.example.com", http_code=500, timestamp=t2)
     )
-    ordered = sorted(app.urls, key=lambda u: app.row_sort_key(Text(u)))
+    ordered = sorted_urls(app)
     assert ordered == ["http://second-error.example.com", "http://first-error.example.com"]
 
 
@@ -465,26 +488,28 @@ def test_row_sort_key_different_error_code_does_move_to_top():
     t1 = t0 + timedelta(seconds=1)
     t2 = t0 + timedelta(seconds=2)
 
-    app.states["http://first-error.example.com"].apply(
+    state_for(app, "http://first-error.example.com").apply(
         make_result(url="http://first-error.example.com", http_code=500, timestamp=t0)
     )
-    app.states["http://second-error.example.com"].apply(
+    state_for(app, "http://second-error.example.com").apply(
         make_result(url="http://second-error.example.com", http_code=500, timestamp=t1)
     )
 
     # first-error now returns a *different* error code -- this is a genuinely new
     # error, so it should jump back to the top.
-    app.states["http://first-error.example.com"].apply(
+    state_for(app, "http://first-error.example.com").apply(
         make_result(url="http://first-error.example.com", http_code=503, timestamp=t2)
     )
-    ordered = sorted(app.urls, key=lambda u: app.row_sort_key(Text(u)))
+    ordered = sorted_urls(app)
     assert ordered == ["http://first-error.example.com", "http://second-error.example.com"]
 
 
-def test_row_sort_key_accepts_plain_string_cell():
+def test_row_sort_key_uses_identity_independent_of_display_text():
     app = make_app(["http://example.com"])
-    # row_sort_key should handle both Text cells (real usage) and plain strings.
-    assert app.row_sort_key("http://example.com") == app.row_sort_key(Text("http://example.com"))
+    cell = url_cell(app, "http://example.com")
+    original_key = app.row_sort_key(cell)
+    cell.plain = "a different display label"
+    assert app.row_sort_key(cell) == original_key
 
 
 def make_grouped_app(groups: dict[str, list[str]]) -> PingWatchApp:
@@ -501,10 +526,10 @@ def test_row_sort_key_keeps_groups_contiguous_even_with_cross_group_error():
         }
     )
     for url in ["http://a.example.com", "http://b.example.com"]:
-        app.states[url].apply(make_result(url=url))
-    app.states["http://err.example.com"].apply(make_result(url="http://err.example.com", http_code=500))
+        state_for(app, url).apply(make_result(url=url))
+    state_for(app, "http://err.example.com").apply(make_result(url="http://err.example.com", http_code=500))
 
-    cells = [Text("first-group"), Text("http://a.example.com"), Text("http://b.example.com"), Text("second-group"), Text("http://err.example.com")]
+    cells = [group_cell("first-group"), url_cell(app, "http://a.example.com"), url_cell(app, "http://b.example.com"), group_cell("second-group"), url_cell(app, "http://err.example.com")]
     ordered = sorted(cells, key=lambda c: app.row_sort_key(c))
     assert [c.plain for c in ordered] == [
         "first-group",
@@ -517,10 +542,10 @@ def test_row_sort_key_keeps_groups_contiguous_even_with_cross_group_error():
 
 def test_row_sort_key_heading_sorts_before_its_group_errors():
     app = make_grouped_app({"my-group": ["http://err.example.com", "http://ok.example.com"]})
-    app.states["http://err.example.com"].apply(make_result(url="http://err.example.com", http_code=500))
-    app.states["http://ok.example.com"].apply(make_result(url="http://ok.example.com"))
+    state_for(app, "http://err.example.com").apply(make_result(url="http://err.example.com", http_code=500))
+    state_for(app, "http://ok.example.com").apply(make_result(url="http://ok.example.com"))
 
-    cells = [Text("http://err.example.com"), Text("http://ok.example.com"), Text("my-group")]
+    cells = [url_cell(app, "http://err.example.com"), url_cell(app, "http://ok.example.com"), group_cell("my-group")]
     ordered = sorted(cells, key=lambda c: app.row_sort_key(c))
     assert [c.plain for c in ordered] == ["my-group", "http://err.example.com", "http://ok.example.com"]
 
@@ -549,15 +574,15 @@ async def test_reorder_rows_moves_new_error_to_top(monkeypatch):
         ]
 
         # gamma becomes an error -> should jump to the top
-        app.states["http://gamma.example.com"].apply(make_result(url="http://gamma.example.com", http_code=500))
-        app.render_row("http://gamma.example.com")
+        state_for(app, "http://gamma.example.com").apply(make_result(url="http://gamma.example.com", http_code=500))
+        app.render_row(target_id(app, "http://gamma.example.com"))
         app.reorder_rows()
 
         assert visible_urls()[0] == "http://gamma.example.com"
 
         # beta becomes a warning -> should land right after the error, above alpha
-        app.states["http://beta.example.com"].apply(make_result(url="http://beta.example.com", total_time=5.0))
-        app.render_row("http://beta.example.com")
+        state_for(app, "http://beta.example.com").apply(make_result(url="http://beta.example.com", total_time=5.0))
+        app.render_row(target_id(app, "http://beta.example.com"))
         app.reorder_rows()
 
         assert visible_urls() == [
@@ -567,8 +592,8 @@ async def test_reorder_rows_moves_new_error_to_top(monkeypatch):
         ]
 
         # alpha now errors too, so it should jump above the (older) gamma error.
-        app.states["http://alpha.example.com"].apply(make_result(url="http://alpha.example.com", http_code=500))
-        app.render_row("http://alpha.example.com")
+        state_for(app, "http://alpha.example.com").apply(make_result(url="http://alpha.example.com", http_code=500))
+        app.render_row(target_id(app, "http://alpha.example.com"))
         app.reorder_rows()
 
         assert visible_urls() == [
@@ -578,8 +603,8 @@ async def test_reorder_rows_moves_new_error_to_top(monkeypatch):
         ]
 
         # gamma errors again with the SAME code -- it must NOT jump back above alpha.
-        app.states["http://gamma.example.com"].apply(make_result(url="http://gamma.example.com", http_code=500))
-        app.render_row("http://gamma.example.com")
+        state_for(app, "http://gamma.example.com").apply(make_result(url="http://gamma.example.com", http_code=500))
+        app.render_row(target_id(app, "http://gamma.example.com"))
         app.reorder_rows()
 
         assert visible_urls() == [

@@ -5,24 +5,64 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import aiohttp
 import yaml
+from rich.style import Style
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.command import Hit, Hits, Provider
 from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, Label, Static
+from yarl import URL
 
 SLOW_THRESHOLD_SECONDS = 3
 STICKY_DURATION = timedelta(minutes=5)
 DEFAULT_RTT_WINDOW_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class ConnectTo:
+    host: str
+    port: int
+
+    def __str__(self) -> str:
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{host}:{self.port}"
+
+
+@dataclass(frozen=True)
+class ConnectionRoute:
+    source_host: str
+    source_port: int
+    destination: ConnectTo
+
+
+@dataclass(frozen=True)
+class Target:
+    id: str
+    url: str
+    name: str | None = None
+    connect_to: ConnectTo | None = None
+
+    @property
+    def label(self) -> str:
+        return f"{self.name}: {self.url}" if self.name else self.url
+
+    @property
+    def route(self) -> ConnectionRoute | None:
+        if self.connect_to is None:
+            return None
+        url = URL(self.url)
+        assert url.raw_host is not None and url.port is not None
+        return ConnectionRoute(url.raw_host, url.port, self.connect_to)
 
 
 @dataclass
@@ -78,9 +118,30 @@ def _make_trace_config() -> aiohttp.TraceConfig:
     return trace_config
 
 
-def make_session(max_concurrent: int) -> aiohttp.ClientSession:
-    """A single session shared by all pings, so keep-alive connections and DNS results are reused."""
-    connector = aiohttp.TCPConnector(limit=max_concurrent)
+class ConnectToConnector(aiohttp.TCPConnector):
+    """Change only the network destination, retaining the request's HTTP/TLS identity.
+
+    aiohttp has no public connect-to hook. Keep this internal override small and
+    cover it with HTTP/TLS integration tests when upgrading aiohttp.
+    """
+
+    def __init__(self, route: ConnectionRoute, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.route = route
+
+    async def _resolve_host(self, host, port, traces=None):
+        if (host, port) == (self.route.source_host, self.route.source_port):
+            host, port = self.route.destination.host, self.route.destination.port
+        return await super()._resolve_host(host, port, traces=traces)
+
+
+def make_session(max_concurrent: int, route: ConnectionRoute | None = None) -> aiohttp.ClientSession:
+    """Reuse keep-alive connections and DNS results within a single route."""
+    connector = (
+        ConnectToConnector(route, limit=max_concurrent)
+        if route is not None
+        else aiohttp.TCPConnector(limit=max_concurrent)
+    )
     return aiohttp.ClientSession(
         connector=connector,
         timeout=REQUEST_TIMEOUT,
@@ -207,14 +268,25 @@ def setup_logging(log_dir: Path) -> logging.Logger:
     return logger
 
 
-def log_result(logger: logging.Logger, result: PingResult, is_bad: bool, slow_threshold: float) -> None:
+def log_result(
+    logger: logging.Logger,
+    result: PingResult,
+    is_bad: bool,
+    slow_threshold: float,
+    target: Target | None = None,
+) -> None:
+    label = result.url
+    if target is not None:
+        label = f"{target.label} entry={target.id}"
+        if target.connect_to is not None:
+            label += f" connect_to={target.connect_to}"
     if result.error is not None:
-        msg = f"{result.url} ERROR {result.error}"
+        msg = f"{label} ERROR {result.error}"
         logger.error(msg)
         return
 
     msg = (
-        f"{result.url} code={result.http_code} connect={result.connect_time:.3f}s "
+        f"{label} code={result.http_code} connect={result.connect_time:.3f}s "
         f"ttfb={result.ttfb:.3f}s total={result.total_time:.3f}s"
     )
     logger.info(msg)
@@ -233,24 +305,110 @@ def read_urls(path: Path) -> list[str]:
     return urls
 
 
-def read_url_groups(path: Path) -> dict[str, list[str]]:
-    data = yaml.safe_load(path.read_text()) or {}
+def _parse_target(entry: object) -> Target:
+    if isinstance(entry, str):
+        return Target("", entry)
+    if not isinstance(entry, dict):
+        raise ValueError("expected a URL string or a mapping with url, name, and connect_to")
+    if entry.keys() - {"url", "name", "connect_to"}:
+        raise ValueError("unknown entry field (allowed: url, name, connect_to)")
+    url = entry.get("url")
+    if not isinstance(url, str) or not url or any(c.isspace() for c in url):
+        raise ValueError("url must be an absolute HTTP(S) URL")
+    try:
+        parsed = URL(url)
+        if parsed.scheme not in ("http", "https") or not parsed.raw_host or not parsed.port:
+            raise ValueError("missing HTTP(S) scheme, host, or port")
+    except (ValueError, TypeError) as exc:
+        raise ValueError("url must be an absolute HTTP(S) URL with a valid port") from exc
+    name = entry.get("name")
+    if "name" in entry and (not isinstance(name, str) or not name.strip()):
+        raise ValueError("name must be a nonempty string")
+    destination = None
+    if "connect_to" in entry:
+        override = entry["connect_to"]
+        if not isinstance(override, dict) or override.keys() - {"host", "port"}:
+            raise ValueError("connect_to must be a mapping with host and optional port")
+        host = override.get("host")
+        if not isinstance(host, str) or not host or any(c.isspace() for c in host):
+            raise ValueError("connect_to.host must be a hostname or IP address")
+        if any(c in host for c in "/?#@[]"):
+            raise ValueError("connect_to.host must be a hostname or unbracketed IP address")
+        if ":" in host:
+            try:
+                ipaddress.IPv6Address(host)
+            except ValueError as exc:
+                raise ValueError("connect_to.host must not include a scheme or port") from exc
+        elif host.replace(".", "").isdigit():
+            # aiohttp rejects legacy numeric forms such as 127.1 at request time.
+            try:
+                ipaddress.IPv4Address(host)
+            except ValueError as exc:
+                raise ValueError("connect_to.host must be a canonical IPv4 address") from exc
+        else:
+            try:
+                host = host.encode("idna").decode("ascii").lower()
+            except UnicodeError as exc:
+                raise ValueError("connect_to.host must be a valid hostname") from exc
+        port = override.get("port", parsed.port)
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("connect_to.port must be an integer from 1 to 65535")
+        destination = ConnectTo(host, port)
+    return Target("", url, name=name, connect_to=destination)
+
+
+def normalize_groups(groups: dict[str, list[Target | str]]) -> dict[str, list[Target]]:
+    """Assign identities by configuration position, including repeated URLs."""
+    return {
+        name: [
+            replace(entry, id=f"target:{group_index}:{index}")
+            if isinstance(entry, Target)
+            else Target(f"target:{group_index}:{index}", entry)
+            for index, entry in enumerate(entries)
+        ]
+        for group_index, (name, entries) in enumerate(groups.items())
+    }
+
+
+def read_url_groups(path: Path) -> dict[str, list[Target]]:
+    data = yaml.safe_load(path.read_text())
+    if data is None:
+        data = {}
     if not isinstance(data, dict):
         raise ValueError(f"{path}: expected a mapping of group name to list of URLs")
-    return {str(name).upper(): [str(url) for url in (urls or [])] for name, urls in data.items()}
+    groups = {}
+    for name, entries in data.items():
+        name = str(name).upper()
+        if name in groups:
+            raise ValueError(f"{path}: duplicate group name {name!r}")
+        if entries is None:
+            entries = []
+        if not isinstance(entries, list):
+            raise ValueError(f"{path}: group {name!r}: expected a list of URLs")
+        groups[name] = []
+        for index, entry in enumerate(entries):
+            try:
+                target = _parse_target(entry)
+            except ValueError as exc:
+                raise ValueError(f"{path}: group {name!r}, entry {index + 1}: {exc}") from exc
+            groups[name].append(target)
+    return normalize_groups(groups)
 
 
-def load_groups(path: Path) -> dict[str, list[str]]:
+def load_groups(path: Path) -> dict[str, list[Target]]:
     if path.suffix.lower() in (".yaml", ".yml"):
         return read_url_groups(path)
-    return {"": read_urls(path)}
+    return normalize_groups({"": read_urls(path)})
 
 
 def fmt_seconds(value: float | None) -> str:
     return f"{value:.3f}s" if value is not None else "-"
 
 
-COLUMNS = ("URL", "Last RTT", "Last HTTP code", "Longest RTT", "Baseline", "Ever Error", "HTTP Err", "Slow RTT")
+COLUMNS = (
+    "URL", "Connect to", "Last RTT", "Last HTTP code", "Longest RTT",
+    "Baseline", "Ever Error", "HTTP Err", "Slow RTT",
+)
 
 
 class SettingsInputScreen(ModalScreen[float | None]):
@@ -315,7 +473,7 @@ class PingWatchApp(App):
 
     def __init__(
         self,
-        groups: dict[str, list[str]],
+        groups: dict[str, list[Target | str]],
         interval: float,
         logger: logging.Logger,
         max_concurrent: int = 20,
@@ -326,10 +484,10 @@ class PingWatchApp(App):
         requests_per_url: int = 1,
     ):
         super().__init__()
-        self.groups = groups
-        self.urls = [url for urls in groups.values() for url in urls]
-        self.url_group: dict[str, str] = {url: name for name, urls in groups.items() for url in urls}
-        self.group_index: dict[str, int] = {name: i for i, name in enumerate(groups)}
+        self.groups = normalize_groups(groups)
+        self.targets = {target.id: target for targets in self.groups.values() for target in targets}
+        self.target_group = {target.id: name for name, targets in self.groups.items() for target in targets}
+        self.group_index: dict[str, int] = {name: i for i, name in enumerate(self.groups)}
         self.interval = interval
         self.requests_per_url = requests_per_url
         self.logger = logger
@@ -340,20 +498,20 @@ class PingWatchApp(App):
         self.max_concurrent = max_concurrent
         self.sem = asyncio.Semaphore(max_concurrent)
         self.states: dict[str, UrlState] = {
-            url: UrlState(
-                url,
+            target.id: UrlState(
+                target.url,
                 initial_state_normal=initial_state_normal,
                 rtt_window=self.rtt_window,
                 slow_threshold_seconds=self.slow_threshold_seconds,
                 sticky_duration=self.sticky_duration,
             )
-            for url in self.urls
+            for target in self.targets.values()
         }
         self._row_keys: dict[str, object] = {}
         self._column_keys: dict[str, object] = {}
-        self._heading_texts: dict[str, str] = {name: name for name in groups if name}
         self._heading_row_keys: dict[str, object] = {}
-        self.collapsed: dict[str, bool] = {name: False for name in groups if name}
+        self.collapsed: dict[str, bool] = {name: False for name in self.groups if name}
+        self.sessions: dict[ConnectionRoute | None, aiohttp.ClientSession] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -377,9 +535,9 @@ class PingWatchApp(App):
         table.cursor_type = "row"
         column_keys = table.add_columns(*COLUMNS)
         self._column_keys = dict(zip(COLUMNS, column_keys))
-        for group_name, urls in self.groups.items():
+        for group_name, targets in self.groups.items():
             if group_name:
-                heading = Text("\n")
+                heading = Text("\n", style=Style(meta={"group": group_name}))
                 heading.append(group_name, style="bold reverse")
                 heading_key = table.add_row(
                     heading,
@@ -388,40 +546,49 @@ class PingWatchApp(App):
                     key=f"__group__{group_name}",
                 )
                 self._heading_row_keys[group_name] = heading_key
-            for url in urls:
-                key = table.add_row(*("-",) * len(COLUMNS), key=url)
-                self._row_keys[url] = key
-                self.render_row(url)
+            for target in targets:
+                key = table.add_row(*("-",) * len(COLUMNS), key=target.id)
+                self._row_keys[target.id] = key
+                self.render_row(target.id)
 
         for group_name in self._heading_row_keys:
             self.update_group_heading(group_name)
 
-        self.session = make_session(self.max_concurrent)
-
-        for url in self.urls:
+        for target in self.targets.values():
+            route = target.route
+            if route not in self.sessions:
+                self.sessions[route] = make_session(self.max_concurrent, route)
             for stream in range(self.requests_per_url):
                 offset = (self.interval / self.requests_per_url) * stream
-                self.run_worker(self.ping_loop(url, initial_delay=offset), exclusive=False)
+                self.run_worker(self.ping_loop(target.id, initial_delay=offset), exclusive=False)
 
         self.set_interval(1.0, self.refresh_row_colors)
 
     async def on_unmount(self) -> None:
-        await self.session.close()
+        workers = list(self.workers)
+        self.workers.cancel_all()
+        await asyncio.gather(*(worker.wait() for worker in workers), return_exceptions=True)
+        await asyncio.gather(*(session.close() for session in self.sessions.values()))
 
-    async def ping_loop(self, url: str, initial_delay: float = 0.0) -> None:
+    async def ping_loop(self, target_id: str, initial_delay: float = 0.0) -> None:
         if initial_delay:
             await asyncio.sleep(initial_delay)
-        state = self.states[url]
+        target = self.targets[target_id]
+        state = self.states[target_id]
+        session = self.sessions[target.route]
         while True:
-            result = await ping(url, self.session, self.sem)
+            result = await ping(target.url, session, self.sem)
+            # Textual removes screens before dispatching the app's Unmount event.
+            if not self.is_running:
+                return
             is_bad = state.apply(result)
-            log_result(self.logger, result, is_bad, state.slow_threshold_seconds)
-            self.render_row(url)
+            log_result(self.logger, result, is_bad, state.slow_threshold_seconds, target)
+            self.render_row(target_id)
             self.reorder_rows()
             await asyncio.sleep(self.interval)
 
-    def row_style(self, url: str) -> str:
-        state = self.states[url]
+    def row_style(self, target_id: str) -> str:
+        state = self.states[target_id]
         now = datetime.now()
         if state.is_error(now):
             return "white on red"
@@ -429,14 +596,21 @@ class PingWatchApp(App):
             return "black on yellow"
         return ""
 
-    def render_row(self, url: str) -> None:
-        if url not in self._row_keys:
+    def url_cell(self, target_id: str, style: str = "") -> Text:
+        return Text(
+            self.targets[target_id].label,
+            style=Style.parse(style) + Style(meta={"target_id": target_id}),
+        )
+
+    def render_row(self, target_id: str) -> None:
+        if target_id not in self._row_keys:
             return
-        state = self.states[url]
+        target = self.targets[target_id]
+        state = self.states[target_id]
         result = state.last
         now = datetime.now()
         table = self.query_one(DataTable)
-        row_key = self._row_keys[url]
+        row_key = self._row_keys[target_id]
 
         last_rtt = fmt_seconds(result.total_time) if result else "-"
         last_response = f"HTTP {result.http_code}" if result and result.http_code else (result.error if result else "-")
@@ -453,14 +627,19 @@ class PingWatchApp(App):
         http_err = state.error_code if state.is_error(now) else "-"
         slow_rtt = fmt_seconds(state.slow_rtt) if state.is_warning(now) else "-"
 
-        style = self.row_style(url)
-        values = (url, last_rtt, last_response, longest_rtt, baseline, ever_non_200, http_err, slow_rtt)
+        style = self.row_style(target_id)
+        destination = str(target.connect_to) if target.connect_to else "-"
+        values = (
+            target.label, destination, last_rtt, last_response, longest_rtt,
+            baseline, ever_non_200, http_err, slow_rtt,
+        )
         for col, value in zip(COLUMNS, values):
-            table.update_cell(row_key, self._column_keys[col], Text(value, style=style))
+            cell = self.url_cell(target_id, style) if col == "URL" else Text(value, style=style)
+            table.update_cell(row_key, self._column_keys[col], cell)
 
     def refresh_row_colors(self) -> None:
-        for url in self.urls:
-            self.render_row(url)
+        for target_id in self.targets:
+            self.render_row(target_id)
         for group_name in self._heading_row_keys:
             self.update_group_heading(group_name)
         self.reorder_rows()
@@ -530,13 +709,13 @@ class PingWatchApp(App):
     def update_group_heading(self, group_name: str) -> None:
         table = self.query_one(DataTable)
         row_key = self._heading_row_keys[group_name]
-        urls = self.groups[group_name]
+        target_ids = [target.id for target in self.groups[group_name]]
         now = datetime.now()
-        error_count = sum(1 for u in urls if self.states[u].is_error(now))
-        warning_count = sum(1 for u in urls if self.states[u].is_warning(now))
+        error_count = sum(1 for target_id in target_ids if self.states[target_id].is_error(now))
+        warning_count = sum(1 for target_id in target_ids if self.states[target_id].is_warning(now))
         rtts = [
-            rtt for u in urls
-            if (rtt := self.states[u].max_rtt_in_window(now)) is not None
+            rtt for target_id in target_ids
+            if (rtt := self.states[target_id].max_rtt_in_window(now)) is not None
         ]
         max_rtt = fmt_seconds(max(rtts)) if rtts else "-"
         arrow = "▶" if self.collapsed[group_name] else "▼"
@@ -560,30 +739,32 @@ class PingWatchApp(App):
         self.collapsed[group_name] = not self.collapsed[group_name]
         table = self.query_one(DataTable)
         if self.collapsed[group_name]:
-            for url in self.groups[group_name]:
-                if url in self._row_keys:
-                    table.remove_row(self._row_keys.pop(url))
+            for target in self.groups[group_name]:
+                if target.id in self._row_keys:
+                    table.remove_row(self._row_keys.pop(target.id))
         else:
-            for url in self.groups[group_name]:
-                key = table.add_row(*("-",) * len(COLUMNS), key=url)
-                self._row_keys[url] = key
-                self.render_row(url)
+            for target in self.groups[group_name]:
+                key = table.add_row(*("-",) * len(COLUMNS), key=target.id)
+                self._row_keys[target.id] = key
+                self.render_row(target.id)
         self.update_group_heading(group_name)
         self.reorder_rows()
 
-    def row_sort_key(self, url_cell: Text | str) -> tuple:
-        text = (url_cell.plain if isinstance(url_cell, Text) else str(url_cell)).strip()
-        group_name = self._heading_texts.get(text)
+    def row_sort_key(self, url_cell: Text) -> tuple:
+        metadata = url_cell.style.meta
+        group_name = metadata.get("group")
         if group_name is not None:
             return (self.group_index[group_name], -1, "")
-        state = self.states[text]
-        group_idx = self.group_index[self.url_group[text]]
+        target_id = metadata["target_id"]
+        target = self.targets[target_id]
+        state = self.states[target_id]
+        group_idx = self.group_index[self.target_group[target_id]]
         now = datetime.now()
         if state.is_error(now):
-            return (group_idx, 0, -state.error_since.timestamp())
+            return (group_idx, 0, -state.error_since.timestamp(), target_id)
         if state.is_warning(now):
-            return (group_idx, 1, -state.slow_since.timestamp())
-        return (group_idx, 2, text)
+            return (group_idx, 1, -state.slow_since.timestamp(), target_id)
+        return (group_idx, 2, target.url, target.name or "", str(target.connect_to or ""), target_id)
 
     def reorder_rows(self) -> None:
         table = self.query_one(DataTable)
@@ -595,11 +776,11 @@ def main() -> None:
     parser.add_argument(
         "urls_file",
         type=Path,
-        help="URL list file: a .yaml/.yml file of group name -> list of URLs, or a plain-text file with one URL per line",
+        help="URL list file: YAML groups of URLs or entries with url/name/connect_to, or plain text with one URL per line",
     )
     parser.add_argument("--interval", type=float, default=1.0, help="Seconds between pings per URL (default: 1.0)")
     parser.add_argument("--log-dir", type=Path, default=Path("logs"), help="Directory for info/warning/error logs")
-    parser.add_argument("--max-concurrent", type=int, default=20, help="Max curl processes in flight at once (default: 20)")
+    parser.add_argument("--max-concurrent", type=int, default=20, help="Max HTTP requests in flight at once (default: 20)")
     parser.add_argument(
         "--requests-per-url",
         type=int,
@@ -631,9 +812,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    groups = load_groups(args.urls_file)
-    urls = [url for urls in groups.values() for url in urls]
-    if not urls:
+    try:
+        groups = load_groups(args.urls_file)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        parser.error(str(exc))
+    if not any(groups.values()):
         parser.error(f"No URLs found in {args.urls_file}")
 
     logger = setup_logging(args.log_dir)

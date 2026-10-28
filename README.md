@@ -1,12 +1,11 @@
 # pingwatch
 
-A terminal UI for watching the health of a list of URLs. Pings each URL concurrently on a fixed interval using `curl`, and shows live status in a `textual`-based table — with rows highlighted red on non-200 responses/errors and yellow on slow responses. URLs can be organized into named groups, each shown as its own labeled section; within a group, rows are kept sorted so errors float to the top, warnings sit just below current errors, and normal URLs are sorted alphabetically below both.
+A terminal UI for watching the health of a list of URLs. Pings each URL concurrently on a fixed interval using `aiohttp`, and shows live status in a `textual`-based table — with rows highlighted red on non-200 responses/errors and yellow on slow responses. URLs can be organized into named groups, each shown as its own labeled section; within a group, rows are kept sorted so errors float to the top, warnings sit just below current errors, and normal URLs are sorted alphabetically below both.
 
 ## Requirements
 
 - Python 3
-- `curl` on your `PATH`
-- [`textual`](https://textual.textualize.io/) (see `requirements.txt`)
+- `aiohttp`, `pyyaml`, and [`textual`](https://textual.textualize.io/) (see `requirements.txt`)
 
 ## Setup
 
@@ -35,15 +34,46 @@ The URL file can be either:
 - A **YAML file** (`.yaml`/`.yml`) mapping group name to a list of URLs. Each group is rendered as its own labeled section in the table:
   ```yaml
   my-group:
-    - url1.example.com
-    - url2.example.com
+    - https://url1.example.com
+    - https://url2.example.com
   other-group:
-    - other.url.com
-    - other2.url.com
+    - https://other.url.com
+    - https://other2.url.com
   ```
 - A **plain-text file** (any other extension) with one URL per line; blank lines and lines starting with `#` are ignored. All URLs are treated as one ungrouped list, with no heading shown.
 
 `urls.txt` is a sample plain-text file exercising healthy, erroring, redirecting, slow, and unreachable URLs. `urls/` is gitignored — use it to keep your own (e.g. project-specific) URL lists locally without committing them.
+
+### Optional connection destination (`connect_to`)
+
+YAML groups can mix URL strings with entries containing `url`, an optional `name`, and an optional `connect_to` destination:
+
+```yaml
+trailer:
+  - name: normal
+    url: https://api.example.com/api
+  - name: front-door
+    url: https://api.example.com/api
+    connect_to:
+      host: edge.example.net
+      port: 443
+```
+
+The `front-door` entry connects to the edge hostname on port 443, with the connection behavior of:
+
+```bash
+curl -v -o /dev/null \
+  --connect-to 'api.example.com:443:edge.example.net:443' \
+  'https://api.example.com/api'
+```
+
+The request URL, HTTP `Host` header, TLS SNI, and certificate verification continue to use `api.example.com`. Only the network destination changes. Pingwatch consumes the response body without displaying it and reports timings and errors in its table and logs; it does not produce curl's verbose trace.
+
+`connect_to.host` is required when using an override and accepts a hostname, IPv4 address, or unbracketed IPv6 address. `connect_to.port` is optional and defaults to the URL's effective port (443 for HTTPS, 80 for HTTP, or the URL's explicit port); an explicit destination port must be an integer from 1 to 65535. Structured entries require absolute HTTP(S) URLs. Existing URL strings and plain-text files still work.
+
+Every entry has independent statistics, baselines, and highlights, including repeated URLs within or across groups. Names appear alongside URLs; the **Connect to** column shows the override destination, and logs include the entry ID, name when supplied, and destination when overridden. Connections are pooled separately for each source/destination route, with `--max-concurrent` limiting all requests together.
+
+Redirects retain pingwatch's existing follow behavior. An override applies only to hops matching the entry's original host and port; other destinations connect normally. Destination DNS, connection, timeout, and TLS failures are reported as errors without falling back to the original destination. Wildcard rules and arbitrary curl options are not supported.
 
 ### Options
 
@@ -51,7 +81,7 @@ The URL file can be either:
 |---|---|---|
 | `--interval` | `1.0` | Seconds between pings per URL |
 | `--log-dir` | `logs` | Directory for `info.log`, `warning.log`, `error.log` |
-| `--max-concurrent` | `20` | Max concurrent `curl` processes |
+| `--max-concurrent` | `20` | Max concurrent HTTP requests across all entries |
 | `--requests-per-url` | `1` | Independent, overlapping ping streams to run per URL |
 | `--initial-state-normal` | off | Treat each URL's first observed response as its baseline; flag deviations instead of non-200 |
 | `--rtt-window` | `60` | Rolling window in seconds for each group's "highest RTT" heading figure |
@@ -75,13 +105,14 @@ The palette also has a **Clear** command, which resets every URL's collected sta
 
 ### Baseline mode (`--initial-state-normal`)
 
-Some URLs are expected to return a non-200 status (redirects, auth-gated 401/403s, deprecated 410s, etc). Passing `--initial-state-normal` switches the whole run from "200 is ok" to "whatever the URL returned on its first ping is ok" — every URL's baseline is captured independently from its own first response. After that, a URL is only flagged as an error when its status code (or a curl-level failure) *changes* from that baseline, which is useful for catching regressions in surrounding infrastructure (proxies, gateways, etc.) without the noise of URLs that are non-200 by design.
+Some URLs are expected to return a non-200 status (redirects, auth-gated 401/403s, deprecated 410s, etc). Passing `--initial-state-normal` switches the whole run from "200 is ok" to "whatever the URL returned on its first ping is ok" — every entry's baseline is captured independently from its own first response. After that, a URL is flagged as an error when its status code differs from that baseline or an HTTP client failure occurs, which is useful for catching regressions in surrounding infrastructure (proxies, gateways, etc.) without the noise of URLs that are non-200 by design.
 
 This is a global, whole-run switch — it applies to every URL in the file. If you have a mix of URLs that should always be 200 and URLs with an expected non-200 baseline, put them in separate URL list files and run pingwatch twice. The baseline is only kept in memory for the current run; restarting pingwatch re-captures it from scratch. The **Baseline** column shows what was recorded for each URL.
 
 ### Table columns
 
-- **URL**
+- **URL** — original URL, prefixed with the entry's name when supplied
+- **Connect to** — override destination host and port, or `-` for normal DNS
 - **Last RTT** — total time of the most recent request
 - **Last HTTP code** — status code or error from the most recent request
 - **Longest RTT** — slowest total time seen so far
@@ -97,6 +128,8 @@ uv pip install -r requirements-dev.txt
 pytest
 ```
 
+The HTTP/TLS tests start local loopback servers and use `trustme` to generate test certificates. Connection overrides use aiohttp's internal `_resolve_host` connector hook; run the full suite when upgrading aiohttp to verify destination routing, SNI, and certificate verification.
+
 ## curlping
 
-`curlping <url>` is a small standalone bash script that curls a single URL once per second and prints connect/TTFB/total time and response code, without the TUI.
+`curlping <url>` is a small standalone bash script that curls a single URL once per second and prints connect/TTFB/total time and response code, without the TUI. It requires `curl` on your `PATH`.
